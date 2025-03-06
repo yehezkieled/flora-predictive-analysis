@@ -1,0 +1,811 @@
+---
+title: "34078215_tackD"
+author: "Yehezkiel"
+date: "2024-05-24"
+output: html_document
+---
+# Install and Import libraries
+```{r install libraries}
+# install.packages("rpart")
+# install.packages("rpart.plot")
+# install.packages("randomForest")
+# install.packages("corrplot")
+# install.packages("e1071")
+```
+```{r import libraries}
+library(tidyverse)
+library(ggplot2)
+library(naniar)
+library(lubridate)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(corrplot)
+library(caret)
+library(GGally)
+library(tm)
+library(textstem)
+library(e1071)
+```
+# Import the data
+Let's import all of the data.
+```{r import data}
+# import the dialogue usefulness data
+dial_useful_tr <- read.csv("dialogue_usefulness_train.csv")
+dial_useful_ts <- read.csv("dialogue_usefulness_test.csv")
+dial_useful_vl <- read.csv("dialogue_usefulness_validation.csv")
+
+# import the dialogue utterance data
+dial_utter_tr <- read.csv("dialogue_utterance_train.csv")
+dial_utter_ts <- read.csv("dialogue_utterance_test.csv")
+dial_utter_vl <- read.csv("dialogue_utterance_validation.csv")
+```
+
+# Data Exploration
+Let's explore the data for a bit.
+```{r missing values}
+miss_var_summary(dial_useful_tr)
+miss_var_summary(dial_useful_vl)
+
+miss_var_summary(dial_utter_tr)
+miss_var_summary(dial_utter_vl)
+```
+The data is cleaned, meaning that there is no missing data.
+
+```{r dial_useful explore}
+str(dial_useful_tr)
+head(dial_useful_tr)
+```
+```{r dial_utter explore}
+str(dial_utter_tr)
+head(dial_utter_tr)
+```
+
+# Question 1
+Feature engineering:
+
+1. Number of Question each ID
+
+2. Number of Answer each ID
+
+3. Number of Question-Answer pairing (might be decimal if there is more question or answer). This could serve as an outlier later.
+
+4. Number of distinct days that the student asks FLORA.
+
+5. Number of Q-A pairing each distinct days (Number of Q-A/ distinct days).
+
+6. Average answer text length.
+
+7. Average question text length.
+
+8. Top 5 most common words overall.
+
+```{r feature engineering}
+Q_A_feat_eng_func <- function(utter_df){
+  return(
+    utter_df %>%
+      group_by( # groupby ID and type of dialogue
+        Dialogue_ID..Annonymised., 
+        Interlocutor..either.Chatbot.or.Student.
+      ) %>%
+      summarise(
+        no_rows = n() # get the count of each type of dialogue
+      ) %>%
+      pivot_wider( # make it into columns
+        names_from = Interlocutor..either.Chatbot.or.Student., 
+        values_from = no_rows
+      ) %>%
+      rename( # change the column names
+        no_chatbot = Chatbot,
+        no_student = Student
+      ) %>%
+      mutate( # if there are ID that doesnt have either of Chatbot or ask
+        no_chatbot = ifelse(is.na(no_chatbot), 0, no_chatbot),
+        no_student = ifelse(is.na(no_student), 0, no_student)
+      )
+  )
+}
+# get the data from the dial_utter dfs
+dial_utter_Q_A_tr <- Q_A_feat_eng_func(dial_utter_tr)
+dial_utter_Q_A_ts <- Q_A_feat_eng_func(dial_utter_ts)
+dial_utter_Q_A_vl <- Q_A_feat_eng_func(dial_utter_vl)
+
+
+QA_days_weight_feat_eng_func <- function(utter_df){
+  return(
+    utter_df %>%
+      mutate(
+        date = ymd_hms(Timestamp) %>% # change the date format
+          strftime(format = "%d/%b/%Y")
+      ) %>%
+      group_by(Dialogue_ID..Annonymised.) %>% # groupby ID
+      summarise(
+        no_QA_pair = n()/2, # Q-A pairs is equal to (Q+A)/2
+        no_disct_days = n_distinct(date) # get the number of distinct days
+      ) %>%
+      mutate(
+        no_QA_days = round(no_QA_pair/ no_disct_days, 2) # get the number of QA pairs per day
+      )
+  )
+}
+
+# get the data from the dial_utter dfs
+dial_utter_QA_days_weight_tr <- QA_days_weight_feat_eng_func(dial_utter_tr)
+dial_utter_QA_days_weight_ts <- QA_days_weight_feat_eng_func(dial_utter_ts)
+dial_utter_QA_days_weight_vl <- QA_days_weight_feat_eng_func(dial_utter_vl)
+
+# Average answer text length and question text length.
+ave_txt_length_feat_eng_func <- function(utter_df){
+  return(
+    utter_df %>%
+      mutate(text_length = nchar(Utterance_text)) %>% # calculate the text length
+      group_by(
+        Dialogue_ID..Annonymised., 
+        Interlocutor..either.Chatbot.or.Student.
+      ) %>% # groupby ID and chatbot or student
+      summarise(ave_text_length = mean(text_length)) %>% # get the mean of text_length
+      pivot_wider(
+        names_from = Interlocutor..either.Chatbot.or.Student., 
+        values_from = ave_text_length
+        ) %>% # make the chatbot or student into a column name
+      rename(
+        mean_txt_lngth_student = Student,
+        mean_txt_lngth_chatbot = Chatbot
+      ) %>%
+      mutate( # if there are ID that doesnt have either of Chatbot or ask 
+        mean_txt_lngth_student = ifelse(is.na(mean_txt_lngth_student), 0, mean_txt_lngth_student),
+        mean_txt_lngth_chatbot = ifelse(is.na(mean_txt_lngth_chatbot), 0, mean_txt_lngth_chatbot)
+      )
+  )
+}
+
+# get the data from the dial_utter dfs
+ave_utter_tr <- ave_txt_length_feat_eng_func(dial_utter_tr)
+ave_utter_ts <- ave_txt_length_feat_eng_func(dial_utter_ts)
+ave_utter_vl <- ave_txt_length_feat_eng_func(dial_utter_vl)
+
+# join to the dial_useful dfs
+dial_useful_tr <- dial_useful_tr %>%
+  inner_join(
+    dial_utter_Q_A_tr,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    dial_utter_QA_days_weight_tr,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    ave_utter_tr,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+head(dial_useful_tr)
+
+dial_useful_ts <- dial_useful_ts %>%
+  inner_join(
+    dial_utter_Q_A_ts,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    dial_utter_QA_days_weight_ts,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    ave_utter_ts,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+
+dial_useful_vl <- dial_useful_vl %>%
+  inner_join(
+    dial_utter_Q_A_vl,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    dial_utter_QA_days_weight_vl,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  ) %>%
+  inner_join(
+    ave_utter_vl,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+```
+Let's get the common words as a features.
+```{r feature engineering common words}
+text_preprocessed_func <- function(text_col) {
+  text_token <- Corpus(VectorSource(text_col))
+  # remove stop words
+  text_token <- tm_map(text_token, removeWords, stopwords("en")) 
+  # remove punctuation
+  text_token <- tm_map(text_token, removePunctuation) 
+  # remove all numbers
+  text_token <- tm_map(text_token, removeNumbers)
+  # remove redundant spaces
+  text_token <- tm_map(text_token, stripWhitespace) 
+  # case normalisation
+  text_token <- tm_map(text_token, content_transformer(tolower))
+  
+  # Define a function to lemmatise the text
+  lemmatise_text <- function(text) {
+    lemmatised <- lemmatize_strings(text)
+    return(lemmatised)
+  }
+  
+  # Apply lemmatisation to the corpus
+  text_token_lemmatized <- tm_map(text_token, content_transformer(lemmatise_text))
+  
+  #  Create a matrix which its rows are the documents and columns are the words.
+  text_token_uni_dtm <- DocumentTermMatrix(text_token_lemmatized)
+  
+  # convert to data frame
+  text_matrix <- as.data.frame(as.matrix(text_token_uni_dtm))
+  # make sure the colnames are valid
+  colnames(text_matrix) <- make.names(colnames(text_matrix))
+  
+  return(text_matrix)
+}
+
+dialogue_dial_utter_tr_df <- dial_utter_tr %>%
+  group_by(Dialogue_ID..Annonymised.) %>%
+  summarise(combined_text = paste(Utterance_text, collapse = " "))
+
+dial_useful_tr <- dial_useful_tr %>%
+  inner_join(
+    dialogue_dial_utter_tr_df,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+tf_idf_tr <- text_preprocessed_func(dial_useful_tr$combined_text)
+
+# Calculate the sum of each column
+column_sums <- colSums(tf_idf_tr)
+
+# Get the names of the top 10 columns with the highest sums
+top_5_columns <- names(sort(column_sums, decreasing = TRUE)[1:5])
+
+# Subset the data frame to keep only the top 10 columns
+tf_idf_top_5_tr <- tf_idf_tr[, top_5_columns]
+
+dialogue_dial_utter_ts_df <- dial_utter_ts %>%
+  group_by(Dialogue_ID..Annonymised.) %>%
+  summarise(combined_text = paste(Utterance_text, collapse = " "))
+
+dialogue_dial_utter_vl_df <- dial_utter_vl %>%
+  group_by(Dialogue_ID..Annonymised.) %>%
+  summarise(combined_text = paste(Utterance_text, collapse = " "))
+
+dial_useful_ts <- dial_useful_ts %>%
+  inner_join(
+    dialogue_dial_utter_ts_df,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+
+dial_useful_vl <- dial_useful_vl %>%
+  inner_join(
+    dialogue_dial_utter_vl_df,
+    by = c("Dialogue_ID" = "Dialogue_ID..Annonymised.")
+  )
+
+tf_idf_ts <- text_preprocessed_func(dial_useful_ts$combined_text)
+tf_idf_top_5_ts <- tf_idf_ts[, top_5_columns]
+
+tf_idf_vl <- text_preprocessed_func(dial_useful_vl$combined_text)
+tf_idf_top_5_vl <- tf_idf_vl[, top_5_columns]
+
+dial_useful_tr <- cbind(dial_useful_tr, tf_idf_top_5_tr)
+dial_useful_ts <- cbind(dial_useful_ts, tf_idf_top_5_ts)
+dial_useful_vl <- cbind(dial_useful_vl, tf_idf_top_5_vl)
+
+dial_useful_tr <- dial_useful_tr %>% select(-combined_text)
+dial_useful_ts <- dial_useful_ts %>% select(-combined_text)
+dial_useful_vl <- dial_useful_vl %>% select(-combined_text)
+
+head(dial_useful_tr)
+head(dial_useful_ts)
+head(dial_useful_vl)
+```
+
+For question number one, I'm going to choose:
+1. no_QA_pair
+
+2. mean_txt_lngth_chatbot
+
+Let's construct two boxplots from the training data for the usefulness_score (1 or 2) and (4 or 5) from those features.
+```{r boxplots no_QA_pair}
+# filter the Usefulness_score == 1 or 2
+dial_useful_tr_filtered_1or2 <- dial_useful_tr %>%
+  filter(Usefulness_score == 1 | Usefulness_score == 2) %>%
+  select(Usefulness_score, no_QA_pair)
+head(dial_useful_tr_filtered_1or2)
+
+ggplot(dial_useful_tr_filtered_1or2, aes(x = factor(Usefulness_score), y = no_QA_pair)) +
+  geom_boxplot() +
+  labs(title = "Number of QA Pairs vs Usefulness Score",
+       x = "Usefulness Score",
+       y = "Number of QA Pairs")
+
+# filter the Usefulness_score == 4 or 5.
+dial_useful_tr_filtered_4or5 <- dial_useful_tr %>%
+  filter(Usefulness_score == 4 | Usefulness_score == 5)%>%
+  select(Usefulness_score, no_QA_pair)
+head(dial_useful_tr_filtered_4or5)
+
+ggplot(dial_useful_tr_filtered_4or5, aes(x = factor(Usefulness_score), y = no_QA_pair)) +
+  geom_boxplot() +
+  labs(title = "Number of QA Pairs vs Usefulness Score",
+       x = "Usefulness Score",
+       y = "Number of QA Pairs")
+```
+
+According to the boxplots, the Usefulness Score that has 4 or 5 has a higher number of conversation with FLORA. There are also 2 outliers that we can spot in the Usefulness score for 1 or 2.
+
+```{r boxplots mean_txt_lngth_chatbot}
+# filter the Usefulness_score == 1 or 2
+dial_useful_tr_filtered_1or2 <- dial_useful_tr %>%
+  filter(Usefulness_score == 1 | Usefulness_score == 2) %>%
+  select(Usefulness_score, mean_txt_lngth_chatbot)
+head(dial_useful_tr_filtered_1or2)
+
+ggplot(dial_useful_tr_filtered_1or2, aes(x = factor(Usefulness_score), y = mean_txt_lngth_chatbot)) +
+  geom_boxplot() +
+  labs(title = "Average Answer Text Length vs Usefulness Score",
+       x = "Usefulness Score",
+       y = "Average Answer Text Length")
+
+# filter the Usefulness_score == 4 or 5.
+dial_useful_tr_filtered_4or5 <- dial_useful_tr %>%
+  filter(Usefulness_score == 4 | Usefulness_score == 5)%>%
+  select(Usefulness_score, mean_txt_lngth_chatbot)
+head(dial_useful_tr_filtered_4or5)
+
+ggplot(dial_useful_tr_filtered_4or5, aes(x = factor(Usefulness_score), y = mean_txt_lngth_chatbot)) +
+  geom_boxplot() +
+  labs(title = "Average Answer Text Length vs Usefulness Score",
+       x = "Usefulness Score",
+       y = "Average Answer Text Length")
+```
+The second box plot indicates an outlier, it doesnt make any sense that a usefull score of 5 comes from a very low average text length. This needs to be explore further later.
+
+Exclude my own dialogue.
+```{r search for my dialogue}
+my_dialogue_id <- 1155
+
+my_dialogue_id %in% dial_useful_tr$Dialogue_ID
+
+my_dialogue_id %in% dial_useful_vl$Dialogue_ID
+```
+My dialogue is in the validation data. Let's remove it.
+```{r remove my own dialogue id}
+my_dialogue_data_useful <- dial_useful_vl %>%
+  filter(Dialogue_ID == my_dialogue_id)
+my_dialogue_data_useful
+
+my_dialogue_data_utter <- dial_utter_vl %>%
+  filter(Dialogue_ID..Annonymised. == my_dialogue_id)
+my_dialogue_data_utter
+
+dial_useful_vl <- dial_useful_vl %>%
+  filter(Dialogue_ID != my_dialogue_id)
+my_dialogue_id %in% dial_useful_vl$Dialogue_ID
+
+dial_utter_vl <- dial_utter_vl %>%
+  filter(Dialogue_ID..Annonymised. != my_dialogue_id)
+my_dialogue_id %in% dial_utter_vl$Dialogue_ID..Annonymised.
+```
+
+# Question 2
+For this question I am going to choose Decision Tree.
+```{r Decision Tree}
+set.seed(42)
+model1 <- rpart(Usefulness_score ~ ., data = subset(dial_useful_tr, select = -Dialogue_ID))
+rpart.plot(model1)
+```
+Let's predict the value using the validation data.
+```{r predict values}
+pred_values_tr <- predict(model1, dial_useful_tr)
+pred_values <- predict(model1, dial_useful_vl)
+```
+Let's evaluate the model.
+```{r evaluation}
+# function for rmse
+rmse <-function(actual, predicted) {
+  return(
+    sqrt(mean((as.numeric(actual) - as.numeric(predicted))^2))
+  )
+}
+
+# evaluation function
+evaluation_func <- function(model){
+  pred_values_tr <- predict(model, dial_useful_tr)
+  pred_values <- predict(model, dial_useful_vl)
+  
+  rmse_tr <- rmse(dial_useful_tr$Usefulness_score, pred_values_tr)
+  print(
+    paste(
+      "This is the RMSE of the training dataset: ",
+      rmse_tr
+    )
+  )
+  
+  rmse_vl <- rmse(dial_useful_vl$Usefulness_score, pred_values)
+  print(
+    paste(
+      "This is the RMSE of the validation dataset: ",
+      rmse_vl
+    )
+)
+}
+
+evaluation_func(model1)
+```
+
+# Question 3
+First let's see the importance of each feature.
+```{r feature imporatance}
+model1
+model1$variable.importance
+unique(model1$frame$var[model1$frame$var != "<leaf>"])
+```
+We can see here that the features that are important are only:
+1. no_QA_pair
+
+2. no_chatbot
+
+3. no_student
+
+4. project
+
+5. science
+
+6. datum
+
+7. no_QA_days
+
+8. no_disct_days
+
+And the model only use:
+1. no_disct_days
+
+2. datum
+
+3. no_QA_days
+
+4. science
+
+5. no_chatbot
+
+Let's check the correlation among the features.
+```{r correlation}
+# let's check the data first
+head(dial_useful_tr)
+
+# according to the data, the most suitable correlation test is the Pearson Correlation.
+cor_matrix <- cor(
+  dial_useful_tr %>% select(-Dialogue_ID, -Usefulness_score),
+  method = "pearson"
+)
+
+corrplot(cor_matrix, method = "circle", type = "upper", order = "hclust",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", number.cex = 0.7)
+```
+
+If we look at the correlation result, there are number of features that are used by the model which have high correlation:
+1. project - datum
+
+2. project - science
+
+3. project - datum
+
+4. no_chatbot - no_QA_days
+
+5. no_chatbot - no_disct_days
+
+Looking at the RMSEs from the train and validation dataset, there is a probability that the model is overfit, therefore it is too complex. Thus, we need to remove some of the unnecessary features.
+
+Since no_chatbot and no_QA_days are highly correlated, we are going to choose no_chatbot because it is more important than no_QA_days.
+
+We are going to keep both no_chatbot and no_disct_days even though the correlation is pretty high. This is because both are important features according to the model.
+
+The confirmed features that are going to be used are:
+1. either project, datum, and science 
+
+2. no_disct_days
+
+3. no_chatbot
+
+Since the project-datum-model are highly correlated, let's try few combination of the model:
+1. Use only either project, datum, science
+
+2. Drop either project, datum, science
+```{r model feature testing}
+# select the wanted features
+reduced_useful_tr <- dial_useful_tr %>%
+  select(project, datum, science, no_disct_days, no_chatbot, mean_txt_lngth_student, Usefulness_score)
+
+# Create function to calculate the model
+DT_model_func <- function(df) {
+  DT_model <- rpart(Usefulness_score ~ ., data = df)
+  evaluation_func(DT_model)
+}
+
+set.seed(42)
+# features that we are going to try
+try_features <- c("project", "datum", "science")
+
+# looping the features to drop
+for(i in try_features){
+  # only selecting part of either features
+  print(
+    paste0("This model only select ", i)
+  )
+  # select the data
+  reduced_select_data <- reduced_useful_tr %>%
+    select(all_of(i), no_disct_days, no_chatbot, mean_txt_lngth_student, Usefulness_score)
+  # create the model
+  DT_model_func(reduced_select_data)
+  
+  # dropping part of either features
+  print(
+    paste0("This model drop ", i)
+  )
+  # select the data
+  reduced_drop_data <- reduced_useful_tr %>%
+    select(-all_of(i))
+  # create the model
+  DT_model_func(reduced_drop_data)
+}
+```
+From the result, we can conclude that the most not overfitting model with good RMSE is "only select datum", because it is generelized well.
+
+Let's try to predict with the model.
+```{r prediction DT reduced model}
+# let's reduce the model first
+reduced_useful_tr <- dial_useful_tr %>%
+  select(datum, no_disct_days, no_chatbot, Usefulness_score)
+# create the model
+DT_reduced_model <- rpart(Usefulness_score ~ ., data = reduced_useful_tr)
+# predict the model
+pred_values_tr <- predict(DT_reduced_model, dial_useful_tr)
+pred_values <- predict(DT_reduced_model, dial_useful_vl)
+
+print("prediction for training data")
+table(pred_values_tr)
+print("actual values for the training data")
+table(dial_useful_tr$Usefulness_score)
+
+print("prediction for the validation data")
+table(pred_values)
+print("actual values for the validation data")
+table(dial_useful_vl$Usefulness_score)
+```
+As we can see the dataset is biased towards the Usefulness_score of 3,4, and 5. That is why the model does not predict Usefulness_score for values 1 and less 2.
+
+Let's try to resampled the dataset using bootstrapping, at least the number of Usefulness_score for 1 and 2 should be equal to the average of 3,4, and 5.
+```{r bootstrapping}
+# get the majority and minority data
+majority <- reduced_useful_tr %>%
+  filter(Usefulness_score %in% c(3,4,5))
+minority_1 <- reduced_useful_tr[reduced_useful_tr$Usefulness_score == 1,]
+minority_2 <- reduced_useful_tr[reduced_useful_tr$Usefulness_score == 2,]
+
+# random sampling the minority
+set.seed(42)
+bootstrap_minority_1 <- minority_1[sample(nrow(minority_1), size = round(nrow(majority)/3), replace = TRUE), ]
+bootstrap_minority_2 <- minority_2[sample(nrow(minority_2), size = round(nrow(majority)/3), replace = TRUE), ]
+
+# combine the rows
+balanced_reduced_useful_tr <- rbind(majority, bootstrap_minority_1, bootstrap_minority_2)
+table(balanced_reduced_useful_tr$Usefulness_score)
+```
+
+Let's check our new DT model.
+```{r prediction DT oversample model}
+# create model
+DT_oversampling_model <- rpart(Usefulness_score ~ ., data = balanced_reduced_useful_tr)
+evaluation_func(DT_oversampling_model)
+
+# predict model
+pred_values_tr <- predict(DT_oversampling_model, dial_useful_tr)
+pred_values <- predict(DT_oversampling_model, dial_useful_vl)
+
+print("prediction for training data")
+table(pred_values_tr)
+
+print("prediction for the validation data")
+table(pred_values)
+```
+Now, the model predicts Usefulness_score around 1. The RMSE is worse than the previous model but still acceptable. However, I believe that the distribution of the Usefulness_score is biased towards 3,4, and 5. It can be seen from the same distribution that happens in training and validation data. Thus, the DT_reduced_model is better.
+
+Let's do a cross validation and search grid for the Decision Tree.
+```{r CV decision tree, warning=FALSE}
+# set the cross validation
+train_control <- trainControl(method = "cv", number = 5)
+
+# Define the grid of hyperparameters to search
+tune_grid <- expand.grid(
+  cp = seq(0.01, 0.1, by = 0.01) # Complexity parameter (cp) grid
+)
+
+# Set the seed for reproducibility
+set.seed(42)
+
+# Perform the grid search with cross-validation
+dt_cv_model <- train(
+  Usefulness_score ~ ., 
+  data = reduced_useful_tr, 
+  method = "rpart", 
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Print the best model and the results
+print(dt_cv_model)
+
+# Evaluate the best model (assuming evaluation_func is defined)
+evaluation_func(dt_cv_model)
+```
+The result of the dt_cv_model is able to generelized better than the DT_reduced_model, but it is still underfitting.
+
+After looking at the simple model, let's try more complex model, which is Random forest with the reduced dataset.
+```{r simple random Forest, warning=FALSE}
+# random forest model
+set.seed(42)
+rf_simple_model <- randomForest(
+  Usefulness_score ~ ., 
+  data = reduced_useful_tr,
+  importance = TRUE
+)
+rf_simple_model
+importance(rf_simple_model)
+
+# evaluate the model
+evaluation_func(rf_simple_model)
+```
+
+Looking at the result of the accuracy, it could be seen that the model is now overfitting. Thus, let's try cross validation technique.
+Since the number of rows is 139 and the model is overfitting, I am choosing 5-Fold cross validation and set the ntree = 100 to reduce the overfitting.
+```{r cross validation, warning=FALSE}
+set.seed(42)
+rf_cv_model <- train(
+  Usefulness_score ~ ., 
+  data = reduced_useful_tr, 
+  method = "rf", 
+  trControl = train_control,
+  ntree = 100
+)
+
+rf_cv_model
+evaluation_func(rf_cv_model)
+```
+Okay, looking at the RMSE, the model is too overfitting. Let's try to tune the hyperparameters by using grid search.
+```{r grid search random forest, warning=FALSE}
+# Define the grid of hyperparameters to search
+tune_grid <- expand.grid(
+  mtry = c(2, 4, 6) # Number of variables randomly sampled as candidates at each split
+)
+
+# Set the seed for reproducibility
+set.seed(42)
+# Perform the grid search with cross-validation, using RMSE as the metric
+rf_cv_model_tuned <- train(
+  Usefulness_score ~ ., 
+  data = reduced_useful_tr, 
+  method = "rf", 
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "RMSE", # Specify RMSE as the evaluation metric
+  ntree = 100 # Specify the number of trees to grow
+)
+
+# Print the best model and the results
+print(rf_cv_model_tuned)
+
+# Evaluate the model (assuming evaluation_func is defined)
+evaluation_func(rf_cv_model_tuned)
+```
+The random forest suggests that the model is always overfit. Let's try other models.
+
+Let's try SVM, it is better to start with a simple model first to know what is the main problem of the overall model.
+```{r simple SVM}
+# Train the SVM regression model
+svm_model <- svm(Usefulness_score ~ ., data = reduced_useful_tr, type = "eps-regression")
+# Print the model summary
+summary(svm_model)
+evaluation_func(svm_model)
+```
+Looking at the RMSE, the model is suitable with the dataset. It is unusual for RMSE validation to be less than the training dataset. There are several potential issues:
+1. Small sample size
+A small validation set can lead to an RMSE that doesn't accurately reflect the model's performance on unseen data. This could make the validation RMSE appear artificially low.
+
+2. Randomness
+Random splits in the data can sometimes produce a validation set that is easier to predict than the training set. This is more common when the dataset is not very large or not well shuffled.
+
+Let's try the cross validation with hypermeter tuning for the SVM model.
+```{r SVM cv}
+# Define the grid of hyperparameters to search
+tune_grid <- expand.grid(
+  sigma = 2^(-15:-1),    # Expanded range for sigma
+  C = 2^(-5:15)          # Expanded range for C
+)
+
+# Set the seed for reproducibility
+set.seed(42)
+
+# Train the model
+svm_cv_model <- train(
+  Usefulness_score ~ ., 
+  data = reduced_useful_tr, 
+  method = "svmRadial", 
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "RMSE"
+)
+
+# Print the best model and the results
+print(svm_cv_model)
+
+# Evaluate the model (assuming evaluation_func is defined)
+evaluation_func(svm_cv_model)
+```
+The difference between the svm_model and the svm_cv_model are minimal. While the svm_cv_model shows a better fit to the training data, the svm_model demonstrates slightly better performance on the validation set.
+
+In this case, the differences are so minor that either model could be considered adequate. If the goal is to prioritize validation performance, you might lean slightly towards the svm_model. However, using cross-validation as done with svm_cv_model generally provides a more robust estimate of model performance.
+
+Conclusion:
+1. The first Decision Tree model is used to decrease the features that are used for the model building. From the features importance we get that datum, no_disct_days, and no_chatbot are sufficient and significant to the models.
+
+2. The distribution of the Usefulness_score proves to be skewed to the values of 3,4, and 5, it makes the oversampling method like bootstrapping is not significant.
+
+3. From model testing and optimization, the Decision Tree proves to be underfit even though the RMSE is adequate. 
+
+4. The Random Forest proves to be always overfitting because the training data is small.
+
+5. SVM and cross-validated SVM prove to be the best model.
+
+Thus, after looking for all of the models, the svm_cv_model shows the best result in terms of RMSE. Therefor, we are going to use this model for the prediction.
+```{r final model}
+# getting the reduced validation data
+reduced_useful_vl <- dial_useful_vl %>% select(colnames(reduced_useful_tr))
+# combine it with the reduced_useful_tr
+reduced_useful_final <- rbind(reduced_useful_tr, reduced_useful_vl)
+
+# train the model
+final_model <- train(
+  Usefulness_score ~ ., 
+  data = reduced_useful_final, 
+  method = "svmRadial", 
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "RMSE"
+)
+```
+
+# Q4
+Let's predict my dialgue using the final_model.
+```{r preprocessed my dialgue}
+# preprocessed my dialogue
+reduced_useful_my_diag <- my_dialogue_data_useful %>%
+  select(colnames(reduced_useful_tr))
+print(reduced_useful_my_diag)
+
+# predict my Usefulness_score
+my_usefulness_score <- predict(final_model, reduced_useful_my_diag)
+print(my_usefulness_score)
+```
+The prediction score is not the same as what I had answered. This is due to several things:
+1. The dataset is too small, it makes the model generalization not good and it makes the features not compatible with the model. If the data is big some features might be significant towards the Usefulness_score.
+
+2. The distribution of the Usefulness_score is skewed to values 3,4, and 5, where values = 4 is 42% of the entire dataset. Thus, if the model does not know what to predict it will predict values around 4 to make the RMSE small.
+
+3. My dialogue is an outlier and since the data is too small, there are not many outliers Hence, the model does not have the ability to generalized towards outliers.
+
+# Q5
+Let's predict the unseen dataset which is the dial_useful_ts.
+```{r predict dial_useful_ts}
+# predict the test dataset
+unseen_prediction <- predict(final_model, dial_useful_ts)
+
+# make into df
+unseen_df <- data.frame(Dialogue_ID = dial_useful_ts$Dialogue_ID, Usefullness_score_prediction = unseen_prediction)
+print(unseen_df)
+
+# export the file into a csv file
+write.csv(unseen_df, "Darmadi_34078215_dialogue_usefulness_test.csv", row.names = FALSE)
+```
